@@ -22,7 +22,7 @@ Structura JSON obligatorie:
   "pacient": {
     "nume_complet": "string",
     "varsta": "string",
-    "sex": "string",
+    "sex": "string (M sau F)",
     "data_recoltare": "string (DD.MM.YYYY sau gol)",
     "laborator": "string (numele laboratorului sau clinicii exact cum apare în document, ex: Synevo, Regina Maria, Sanador, Bioclinica; gol dacă nu există)"
   },
@@ -33,17 +33,22 @@ Structura JSON obligatorie:
       "rezultat": "string (valoarea numerica sau textul calitativ)",
       "um": "string (unitatea de masura sau gol)",
       "interval_referinta": "string (copiaza EXACT din document, inclusiv texte lungi; gol daca nu exista)",
+      "interval_ref_pacient": "string (intervalul numeric aplicabil DOAR acestui pacient, ex: '0.29 - 1.67' sau '< 4.2' sau '8.64 - 29'; gol daca nu e interval pe varsta/sex)",
+      "min_ref": number sau null,
+      "max_ref": number sau null,
       "in_afara_limitelor": true sau false
     }
   ]
 }
 
 Reguli stricte:
-1. INTERVAL_REFERINTA: Copiaza TEXTUL COMPLET din coloana de referinta, inclusiv fraze lungi de tip "Conform NCEP ATP III: optim: <200 / borderline: 200-240 / crescut: >240". Nu trunchia, nu reformata.
-2. IN_AFARA_LIMITELOR = true daca: valoarea e bold/colorata diferit, are asterisc (*), sageata (↑↓), H/L, sau depaseste numeric intervalul din acelasi rand.
-3. Include fiecare analiza din document, fara exceptie.
-4. Pentru rezultate calitative (negativ, clara, normal etc.) pune textul exact in campul "rezultat".
-5. Daca un camp lipseste din document, foloseste string gol ""."""
+1. INTERVAL_REFERINTA: Copiaza TEXTUL COMPLET din coloana de referinta, inclusiv fraze lungi. Nu trunchia, nu reformata.
+2. INTERVAL_REF_PACIENT: Daca intervalul contine subintervale pe varsta/sex/stadii (ex: Testosteron, Prolactina, Estradiol), alege randul care corespunde pacientului si scrie DOAR acea valoare (ex: '0.29 - 1.67'). Daca intervalul e simplu sau unic, lasa gol (va fi preluat din interval_referinta). Nu copia textul complet, nu adauga etichete, scrie doar cifrele.
+3. MIN_REF si MAX_REF: Extrage limitele numerice din interval_ref_pacient (daca exista) sau din interval_referinta simplu. Daca exista doar limita superioara (ex: < 100), pune min=null si max=100. Daca nu exista interval numeric, pune null.
+3. IN_AFARA_LIMITELOR = true daca: valoarea e bold/colorata diferit, are asterisc (*), sageata (↑↓), H/L, sau depaseste numeric limitele din acelasi rand.
+4. Include fiecare analiza din document, fara exceptie.
+5. Pentru rezultate calitative (negativ, clara, normal etc.) pune textul exact in campul "rezultat".
+6. Daca un camp lipseste din document, foloseste string gol "" pentru string-uri si null pentru numere."""
 
 
 @app.post("/extract")
@@ -54,7 +59,7 @@ async def extract_text(file: UploadFile = File(...)):
 
         full_response = ""
         for chunk in client.models.generate_content_stream(
-            model="gemini-3.5-flash",
+            model="gemini-2.5-flash",
             contents=[
                 types.Content(
                     role="user",
@@ -62,14 +67,29 @@ async def extract_text(file: UploadFile = File(...)):
                 )
             ],
             config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(thinking_level="MEDIUM"),
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
                 media_resolution="MEDIA_RESOLUTION_HIGH",
                 response_mime_type="application/json",
                 system_instruction=[types.Part.from_text(text=SYSTEM_INSTRUCTION)],
             ),
         ):
-            if chunk.text:
+            # Skip thinking tokens — only accumulate actual response parts
+            if chunk.candidates:
+                for part in chunk.candidates[0].content.parts:
+                    if not getattr(part, "thought", False) and part.text:
+                        full_response += part.text
+            elif chunk.text:
                 full_response += chunk.text
+
+        # Strip markdown code fences if Gemini wrapped the JSON
+        stripped = full_response.strip()
+        if stripped.startswith("```"):
+            lines = stripped.splitlines()
+            stripped = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:]).strip()
+            full_response = stripped
+
+        # Validate JSON before returning
+        json.loads(full_response)
 
         print("=== GEMINI RAW RESPONSE ===")
         print(full_response)
